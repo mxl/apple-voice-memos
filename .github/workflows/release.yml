@@ -1,0 +1,387 @@
+name: Release
+
+on:
+  # Automatic trigger when tags are pushed.
+  push:
+    tags:
+      - 'v*'
+
+  # Manual trigger with an existing tag input.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing release tag (must already exist, e.g., v0.1.0 or v0.1.0-rc.1)'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate release version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            push) VERSION="$PUSH_TAG" ;;
+            workflow_dispatch) VERSION="$MANUAL_VERSION" ;;
+            *)
+              printf '%s\n' 'Unsupported release event.' >&2
+              exit 1
+              ;;
+          esac
+
+          python3 - "$VERSION" <<'PY'
+          import re
+          import sys
+
+          version = sys.argv[1]
+          identifier = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+          pattern = re.compile(
+              rf"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+              rf"(?:-(?:{identifier})(?:\.(?:{identifier}))*)?"
+          )
+          if pattern.fullmatch(version) is None:
+              raise SystemExit(
+                  "release version must match vMAJOR.MINOR.PATCH with an optional "
+                  "conventional prerelease suffix"
+              )
+          PY
+
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          printf 'prerelease=%s\n' "$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve and check out exact tag commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin "refs/tags/${VERSION}:refs/tags/${VERSION}"
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/${VERSION}^{commit}")"
+
+          if [[ "$EVENT_NAME" == push && "$TAG_COMMIT" != "$EVENT_SHA" ]]; then
+            printf '%s\n' 'The release tag no longer points to the commit that triggered this run.' >&2
+            exit 1
+          fi
+
+          git checkout --detach "$TAG_COMMIT"
+          [[ "$(git rev-parse HEAD)" == "$TAG_COMMIT" ]]
+
+      - name: Run tests from exact tag
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+
+      - name: Package and smoke-test archive
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="apple-voice-memos-${VERSION}.zip"
+          ARCHIVE_TOP='apple-voice-memos'
+          WORK_DIR="$(mktemp -d "${RUNNER_TEMP}/apple-voice-memos-release.XXXXXX")"
+          trap 'rm -rf -- "$WORK_DIR"' EXIT
+
+          STAGE="$WORK_DIR/$ARCHIVE_TOP"
+          mkdir -p "$STAGE/scripts" "$WORK_DIR/home"
+
+          # Copy only the release allowlist. Root documentation is placed in the archive top directory.
+          RELEASE_SOURCES=(
+            apple-voice-memos/SKILL.md
+            apple-voice-memos/PROMPT.md
+            apple-voice-memos/scripts/voice-memos
+            apple-voice-memos/scripts/voice_memos.py
+            README.md
+            LICENSE
+          )
+          for SOURCE in "${RELEASE_SOURCES[@]}"; do
+            if [[ ! -f "$SOURCE" || -L "$SOURCE" ]]; then
+              printf 'release source is not a regular file: %s\n' "$SOURCE" >&2
+              exit 1
+            fi
+          done
+
+          install -m 0644 -- apple-voice-memos/SKILL.md "$STAGE/SKILL.md"
+          install -m 0644 -- apple-voice-memos/PROMPT.md "$STAGE/PROMPT.md"
+          install -m 0755 -- apple-voice-memos/scripts/voice-memos "$STAGE/scripts/voice-memos"
+          install -m 0644 -- apple-voice-memos/scripts/voice_memos.py "$STAGE/scripts/voice_memos.py"
+          install -m 0644 -- README.md "$STAGE/README.md"
+          install -m 0644 -- LICENSE "$STAGE/LICENSE"
+
+          (
+            cd "$WORK_DIR"
+            zip -q -X "$ARCHIVE" \
+              "$ARCHIVE_TOP/SKILL.md" \
+              "$ARCHIVE_TOP/PROMPT.md" \
+              "$ARCHIVE_TOP/scripts/voice-memos" \
+              "$ARCHIVE_TOP/scripts/voice_memos.py" \
+              "$ARCHIVE_TOP/README.md" \
+              "$ARCHIVE_TOP/LICENSE"
+          )
+
+          python3 - "$WORK_DIR/$ARCHIVE" "$WORK_DIR/extracted" "$ARCHIVE_TOP" <<'PY'
+          import os
+          import shutil
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive_path, extract_root_arg, archive_top = sys.argv[1:]
+          extract_root = Path(extract_root_arg)
+          required = {
+              f"{archive_top}/SKILL.md",
+              f"{archive_top}/PROMPT.md",
+              f"{archive_top}/scripts/voice-memos",
+              f"{archive_top}/scripts/voice_memos.py",
+              f"{archive_top}/README.md",
+              f"{archive_top}/LICENSE",
+          }
+          excluded_fragments = (
+              "/.git",
+              "/.github",
+              "/.opencode",
+              "/__pycache__",
+              "/.DS_Store",
+              "/.env",
+          )
+
+          with zipfile.ZipFile(archive_path) as archive:
+              infos = archive.infolist()
+              names = [info.filename for info in infos]
+              for info in infos:
+                  name = info.filename
+                  if (
+                      not name
+                      or "\x00" in name
+                      or "\\" in name
+                      or name.startswith(("/", "\\"))
+                  ):
+                      raise SystemExit(f"unsafe archive path: {name!r}")
+                  raw_parts = name.split("/")
+                  parts = PurePosixPath(name).parts
+                  if (
+                      not parts
+                      or any(part in ("", ".", "..") for part in raw_parts)
+                      or parts[0] != archive_top
+                  ):
+                      raise SystemExit(f"unsafe archive path: {name!r}")
+                  if any(fragment in name for fragment in excluded_fragments):
+                      raise SystemExit(f"excluded archive entry: {name!r}")
+                  if info.is_dir() or (info.flag_bits & 0x1):
+                      raise SystemExit(f"non-file archive entry: {name!r}")
+                  mode = (info.external_attr >> 16) & 0xFFFF
+                  file_type = stat.S_IFMT(mode)
+                  if file_type not in (0, stat.S_IFREG):
+                      raise SystemExit(f"non-regular archive entry: {name!r}")
+
+              if len(names) != len(set(names)) or set(names) != required:
+                  missing = sorted(required - set(names))
+                  unexpected = sorted(set(names) - required)
+                  raise SystemExit(
+                      f"archive allowlist mismatch; missing={missing!r}, unexpected={unexpected!r}"
+                  )
+              bad_entry = archive.testzip()
+              if bad_entry is not None:
+                  raise SystemExit(f"archive CRC check failed: {bad_entry!r}")
+
+              extract_root.mkdir()
+              resolved_root = extract_root.resolve()
+              for info in infos:
+                  relative = PurePosixPath(info.filename)
+                  target = extract_root.joinpath(*relative.parts)
+                  resolved_target = target.resolve()
+                  try:
+                      resolved_target.relative_to(resolved_root)
+                  except ValueError as exc:
+                      raise SystemExit(f"archive extraction escaped root: {info.filename!r}") from exc
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(info) as source, target.open("xb") as destination:
+                      shutil.copyfileobj(source, destination, length=1024 * 1024)
+                  mode = (info.external_attr >> 16) & 0o777
+                  if mode:
+                      os.chmod(target, mode)
+          PY
+
+          SMOKE="$WORK_DIR/extracted/$ARCHIVE_TOP/scripts/voice-memos"
+          test -x "$SMOKE"
+          HOME="$WORK_DIR/home" "$SMOKE" --help >/dev/null
+
+          # Explicit overrides and a temporary HOME keep this smoke test isolated from personal data.
+          SMOKE_ROOT="$WORK_DIR/smoke-recordings"
+          SMOKE_DB="$SMOKE_ROOT/CloudRecordings.db"
+          mkdir -p "$SMOKE_ROOT"
+          python3 - "$SMOKE_DB" "$SMOKE_ROOT/synthetic.m4a" <<'PY'
+          import sqlite3
+          import struct
+          import sys
+
+          database, media = sys.argv[1:]
+          connection = sqlite3.connect(database)
+          try:
+              connection.execute(
+                  """CREATE TABLE ZCLOUDRECORDING (
+                      ZUUID TEXT,
+                      ZENCRYPTEDTITLE TEXT,
+                      ZDATE REAL,
+                      ZDURATION REAL,
+                      ZPATH TEXT,
+                      ZDELETED INTEGER
+                  )"""
+              )
+              connection.execute(
+                  "INSERT INTO ZCLOUDRECORDING VALUES (?, ?, ?, ?, ?, ?)",
+                  ("release-smoke", "synthetic release smoke", 0.0, 1.0, "synthetic.m4a", 0),
+              )
+              connection.commit()
+          finally:
+              connection.close()
+
+          with open(media, "wb") as output:
+              output.write(struct.pack(">I4s", 8 + len(b"synthetic"), b"ftyp") + b"synthetic")
+              output.write(struct.pack(">I4s", 8, b"moov"))
+          PY
+
+          SMOKE_JSON="$WORK_DIR/smoke.json"
+          HOME="$WORK_DIR/home" "$SMOKE" \
+            --database "$SMOKE_DB" \
+            --recordings-root "$SMOKE_ROOT" \
+            list --limit 1 --json > "$SMOKE_JSON"
+          python3 - "$SMOKE_JSON" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "recording_id": "release-smoke",
+              "title": "synthetic release smoke",
+              "recorded_at": "2001-01-01T00:00:00Z",
+              "duration": 1.0,
+              "deletion_status": "active",
+              "transcript_availability": "no",
+          }
+          if payload.get("count") != 1 or payload.get("complete") is not True:
+              raise SystemExit("smoke test returned an unexpected list envelope")
+          if payload.get("recordings") != [expected]:
+              raise SystemExit("smoke test returned an unexpected recording")
+          PY
+
+          cp -- "$WORK_DIR/$ARCHIVE" "$GITHUB_WORKSPACE/$ARCHIVE"
+          printf 'archive=%s\n' "$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: release_notes
+        env:
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE="$RUNNER_TEMP/apple-voice-memos-release-notes.md"
+          python3 - "$VERSION" "$REPOSITORY" "$NOTES_FILE" <<'PY'
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+          from textwrap import dedent
+
+          version, repository, notes_file = sys.argv[1:]
+          identifier = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+          release_pattern = re.compile(
+              rf"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+              rf"(?:-(?:{identifier})(?:\.(?:{identifier}))*)?"
+          )
+          tags = subprocess.run(
+              ["git", "tag", "--list", "--sort=-version:refname"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.splitlines()
+          previous = next(
+              (tag for tag in tags if tag != version and release_pattern.fullmatch(tag)),
+              None,
+          )
+
+          if previous is None:
+              changes = "Initial release of the Apple Voice Memos agent skill."
+          else:
+              revision_range = f"{previous}..{version}"
+              count = subprocess.run(
+                  ["git", "rev-list", "--count", revision_range],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout.strip()
+              if count == "0":
+                  changes = f"*No changes - re-release of {previous}*"
+              else:
+                  changes = subprocess.run(
+                      ["git", "log", "--pretty=format:- %s", revision_range],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+
+          body = dedent(f"""\
+          ## Apple Voice Memos Agent Skill {version}
+
+          An agent skill that lists, exports, and reads embedded transcripts from Apple Voice Memos synced via iCloud.
+
+          ### Installation
+
+          ```bash
+          npx skills add https://github.com/{repository} --skill apple-voice-memos
+          ```
+
+          Or download the `apple-voice-memos-{version}.zip` file below and extract it into your agent's skills directory.
+
+          ### What's Changed
+          {changes}
+
+          ### Usage
+          Once installed, use the skill with:
+          ```
+          /apple-voice-memos
+          ```
+
+          See the [README](https://github.com/{repository}/blob/{version}/README.md) for detailed usage instructions.
+          """)
+          Path(notes_file).write_text(body, encoding="utf-8")
+          PY
+          printf 'notes_file=%s\n' "$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b25b93d384199fc0fc8c2e126b2d937a0cbeb2ae # v2.5.2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Apple Voice Memos Skill ${{ steps.version.outputs.version }}
+          body_path: ${{ steps.release_notes.outputs.notes_file }}
+          files: ${{ steps.package.outputs.archive }}
+          draft: false
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

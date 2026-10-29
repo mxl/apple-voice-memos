@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: 0BSD
+"""Executable entry point for the Apple Voice Memos runtime."""
+
+from voice_memos import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
